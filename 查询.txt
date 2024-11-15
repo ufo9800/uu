@@ -1,0 +1,958 @@
+import sys
+import os
+import subprocess
+import decimal
+import pandas as pd
+import pyodbc
+from PyQt5.QtGui import QPixmap
+from PyQt5.QtCore import Qt, QTimer, QByteArray, QPropertyAnimation
+from PyQt5.QtGui import QBrush, QColor, QPalette
+from PyQt5.QtWidgets import (
+    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
+    QPushButton, QLineEdit, QComboBox, QTableWidget, QTableWidgetItem,
+    QLabel, QHeaderView, QMessageBox, QFileDialog, QDialog, QListWidget,
+    QInputDialog
+)
+
+class BOMReverseQueryWindow ( QDialog ):
+    def __init__ ( self, results, highlighted_row=0, parent=None ):
+        super ().__init__ ( parent )
+        self.setWindowTitle ( "BOM反查结果" )
+        self.setGeometry ( 100, 100, 900, 600 )
+        
+        self.result_table = QTableWidget ( self )
+        self.result_table.setColumnCount ( 10 )  # 根据需要调整列数
+        self.result_table.setHorizontalHeaderLabels (
+            ["品号", "品名", "规格", "库存数量", "组成用量", "品号分类", "附件ID", "文件名", "文件更新日期","物料更新日期"] )
+        self.result_table.horizontalHeader ().setSectionResizeMode ( QHeaderView.Stretch )
+        
+        layout = QVBoxLayout ()
+        layout.addWidget ( self.result_table )
+        self.setLayout ( layout )
+        
+        self.update_results ( results, highlighted_row )
+
+
+class FileSearchWindow ( QWidget ):
+    def __init__ ( self, initial_search=None ):
+        super ().__init__ ()
+        self.network_path = r'\\AOK-YF-SERVER\DocLibrary'  # 假设的网络共享路径
+        self.initUI ()
+        if initial_search:
+            self.lineEdit.setText ( initial_search )
+            self.search_files ()  # 使用initial_search自动执行搜索
+    
+    def initUI ( self ):
+        self.setWindowTitle ( '文件位置查询' )
+        self.setGeometry ( 100, 100, 600, 400 )
+        layout = QVBoxLayout ( self )
+        
+        self.infoLabel = QLabel ( "输入编码，搜索对应的文件夹中的文件位置：" )
+        layout.addWidget ( self.infoLabel )
+        
+        self.lineEdit = QLineEdit ()
+        self.lineEdit.setPlaceholderText ( "请输入文件编码" )
+        layout.addWidget ( self.lineEdit )
+        
+        self.searchButton = QPushButton ( "搜索" )
+        self.searchButton.clicked.connect ( self.search_files )
+        layout.addWidget ( self.searchButton )
+        
+        self.resultListWidget = QListWidget ()
+        self.resultListWidget.itemDoubleClicked.connect ( self.open_file_location_with_edge )
+        layout.addWidget ( self.resultListWidget )
+    
+    def search_files ( self ):
+        code = self.lineEdit.text ().strip ()
+        if not code:
+            QMessageBox.critical ( self, "错误", "请输入文件编码进行搜索。" )
+            return
+        
+        self.resultListWidget.clear ()
+        for root, dirs, files in os.walk ( self.network_path ):
+            for file in files:
+                if code in file:
+                    # 构造文件的绝对路径
+                    found_file_path = os.path.join ( root, file )
+                    # 将路径转换为 Edge 浏览器能识别的 URL 格式
+                    found_file_url = found_file_path.replace ( '\\', '/' ).replace ( ' ', '%20' )
+                    found_file_url = f'file://{found_file_url}'
+                    found_file_url = found_file_url.replace ( 'file:////AOK-YF-SERVER', 'file://aok-yf-server' )
+                    self.resultListWidget.addItem ( found_file_url )
+        
+        if not self.resultListWidget.count ():
+            QMessageBox.information ( self, "结果", "没有找到匹配的文件位置。" )
+    
+    def open_file_location_with_edge ( self, item ):
+        file_url = item.text ()
+        # 生成启动 Edge 的命令
+        command = f'start msedge "{file_url}"'
+        try:
+            subprocess.run ( command, shell=True )
+        except subprocess.CalledProcessError as e:
+            QMessageBox.critical ( self, "打开失败", f"尝试在Edge中打开文件位置时出错: {e}" )
+    
+    def open_file_location_with_edge ( self, item ):
+        file_url = item.text ()
+        command = f'start msedge "{file_url}"'
+        try:
+            subprocess.run ( command, shell=True )
+        except subprocess.CalledProcessError as e:
+            QMessageBox.critical ( self, "打开失败", f"尝试在Edge中打开文件位置时出错: {e}" )
+
+
+class EBOMQueryWindow(QWidget):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("EBOM查询")
+        self.setGeometry(200, 200, 600, 400)
+
+        main_layout = QVBoxLayout(self)
+        control_layout = QHBoxLayout()
+        main_layout.addLayout(control_layout)
+
+        self.entry = QLineEdit()
+        control_layout.addWidget(self.entry)
+
+        self.query_button = QPushButton("执行查询")
+        self.query_button.clicked.connect(self.execute_ebom_query)
+        control_layout.addWidget(self.query_button)
+
+        self.entry.returnPressed.connect(self.execute_ebom_query)
+
+        self.decompose_button = QPushButton("分解")
+        self.decompose_button.clicked.connect(self.show_decomposition_window)
+        control_layout.addWidget(self.decompose_button)
+
+        self.result_table = QTableWidget()
+        self.result_table.setColumnCount(3)
+        self.result_table.setHorizontalHeaderLabels(["主件品号", "品名", "规格"])
+        self.result_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.result_table.setSortingEnabled(True)
+        self.result_table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
+        main_layout.addWidget(self.result_table)
+
+        self.result_table.itemDoubleClicked.connect(self.show_decomposition_window)
+
+        self.row_count_label = QLabel("总行数：0")
+        main_layout.addWidget(self.row_count_label)
+
+    def execute_ebom_query(self):
+        input_value = self.entry.text().strip()
+        connection_string = 'DRIVER={ODBC Driver 17 for SQL Server};SERVER=183.239.210.166,264;DATABASE=Aok2107;UID=AOK;PWD=123;TrustServerCertificate=yes;'
+        query = """
+        SELECT MI001, MI002, MI003, MI004 FROM BOMMI
+        WHERE MI001 LIKE ? OR MI002 LIKE ? OR MI003 LIKE ?
+        """
+        try:
+            with pyodbc.connect(connection_string) as conn:
+                cursor = conn.cursor()
+                cursor.execute(query, ['%' + input_value + '%'] * 3)
+                results = cursor.fetchall()
+                self.update_results(results)
+        except Exception as e:
+            QMessageBox.critical(self, "查询失败", f"查询失败: {e}")
+
+    def update_results(self, results):
+        self.result_table.setRowCount(len(results))
+        for row_number, row_data in enumerate(results):
+            for column_number, data in enumerate(row_data):
+                item = QTableWidgetItem(str(data).strip())  # Remove leading/trailing spaces
+                self.result_table.setItem(row_number, column_number, item)
+
+    def on_table_item_clicked(self, item):
+        if item.column() == 0:  # Assuming the first column is the part number column
+            product_code = item.text().strip()[:12]  # Remove leading/trailing spaces and take first 12 characters
+            self.entry.setText(product_code)
+
+    def show_decomposition_window(self):
+        row = self.result_table.currentRow()
+        if row < 0:
+            QMessageBox.warning(self, "提示", "请先选择一个行")
+            return
+        selected_data = [self.result_table.item(row, column).text() for column in
+                         range(self.result_table.columnCount())]
+        self.decomposition_window = DecompositionWindow(selected_data)
+        self.decomposition_window.show()
+
+
+class DecompositionWindow ( QWidget ):
+	def __init__ ( self, selected_data ):
+		super ().__init__ ()
+		self.setWindowTitle ( "EBOM分解" )
+		self.setGeometry ( 100, 100, 900, 600 )
+		
+		layout = QVBoxLayout ( self )
+		
+		self.result_table = QTableWidget ()
+		self.result_table.setColumnCount ( 6 )
+		self.result_table.setHorizontalHeaderLabels ( ["组件品号", "品名", "规格", "位标", "组成用量", "底数"] )
+		self.result_table.horizontalHeader ().setSectionResizeMode ( QHeaderView.Stretch )
+		self.result_table.setSortingEnabled ( True )
+		self.result_table.horizontalHeader ().setSectionResizeMode ( QHeaderView.Interactive )
+		layout.addWidget ( self.result_table )
+		
+		self.export_button = QPushButton ( "导出到Excel" )
+		self.export_button.clicked.connect ( self.export_to_excel )
+		layout.addWidget ( self.export_button )
+		
+		self.selected_data = selected_data
+		self.show_decomposition ()
+	
+	def show_decomposition ( self ):
+		connection_string = 'DRIVER={ODBC Driver 17 for SQL Server};SERVER=183.239.210.166,264;DATABASE=Aok2107;UID=AOK;PWD=123;TrustServerCertificate=yes;'
+		query = """
+        SELECT MK003,
+       CASE
+           WHEN MK003 LIKE 'E%' THEN (SELECT MI002 FROM BOMMI WHERE MI001 = MK003)
+           ELSE (SELECT MB002 FROM INVMB WHERE MB001 = MK003) END AS 品名,
+       CASE
+           WHEN MK003 LIKE 'E%' THEN (SELECT MI003 FROM BOMMI WHERE MI001 = MK003)
+           ELSE (SELECT MB003 FROM INVMB WHERE MB001 = MK003) END AS 规格,
+       MKC01, MK006, MK007
+      FROM BOMMK
+      WHERE MK001 = ?
+        """
+		try:
+			with pyodbc.connect ( connection_string ) as conn:
+				cursor = conn.cursor ()
+				cursor.execute ( query, (self.selected_data[0],) )
+				results = cursor.fetchall ()
+				self.update_results ( results )
+		except Exception as e:
+			QMessageBox.critical ( self, "查询失败", f"查询失败: {e}" )
+	
+	def update_results ( self, results ):
+		self.result_table.setRowCount ( len ( results ) + 1 )
+		redFont = QBrush ( Qt.red )
+		
+		for column_number, data in enumerate ( self.selected_data ):
+			item = QTableWidgetItem ( str ( data ).strip () )  # 去除空格
+			item.setForeground ( redFont )
+			self.result_table.setItem ( 0, column_number, item )
+		
+		for row_number, row_data in enumerate ( results, start=1 ):
+			for column_number, data in enumerate ( row_data ):
+				if column_number==4:
+					formatted_data = "{:.2f}".format ( float ( data ) )
+					item = QTableWidgetItem ( formatted_data )
+				else:
+					item = QTableWidgetItem ( str ( data ).strip () )  # 去除空格
+				self.result_table.setItem ( row_number, column_number, item )
+	
+	def export_to_excel ( self ):
+		options = QFileDialog.Options ()
+		fileName, _ = QFileDialog.getSaveFileName ( self, "保存Excel文件", "", "Excel Files (*.xlsx)", options=options )
+		if fileName:
+			if not fileName.endswith ( '.xlsx' ):
+				fileName += '.xlsx'
+			try:
+				column_headers = [self.result_table.horizontalHeaderItem ( i ).text () for i in
+				                  range ( self.result_table.columnCount () )]
+				table_data = []
+				for row in range ( self.result_table.rowCount () ):
+					row_data = []
+					for column in range ( self.result_table.columnCount () ):
+						item = self.result_table.item ( row, column )
+						row_data.append ( item.text ().strip () if item else '' )  # 去除空格
+					table_data.append ( row_data )
+				df = pd.DataFrame ( table_data, columns=column_headers )
+				df.to_excel ( fileName, index=False )
+				QMessageBox.information ( self, "导出成功", f"数据已导出到 {fileName}" )
+			except Exception as e:
+				QMessageBox.critical ( self, "导出失败", f"发生错误: {e}" )
+	
+	def on_table_item_clicked ( self, item ):
+		if item.column ()==0:  # 假定第一列为品号列
+			product_code = item.text ().strip ()[:12]  # 去除空格并截取前12个字符
+			self.entry.setText ( product_code )
+
+
+class BOMQueryResultWindow ( QWidget ):
+    def __init__ ( self, product_code, product_name=None, product_spec=None, stock_quantity=None,
+                   component_quantity=None, category=None ):
+        super ().__init__ ()
+        self.setWindowTitle ( "BOM查询结果" )
+        self.setGeometry ( 100, 100, 800, 600 )
+        
+        layout = QVBoxLayout ( self )
+        
+        self.result_table = QTableWidget ()
+        self.result_table.setColumnCount ( 7 )  # 包括"位标"列
+        self.result_table.setHorizontalHeaderLabels ( ["品号", "品名", "规格", "库存数量", "组成用量", "品号分类", "位标"] )
+        self.result_table.horizontalHeader ().setSectionResizeMode ( QHeaderView.Stretch )
+        self.result_table.setSortingEnabled ( True )
+        self.result_table.horizontalHeader ().setSectionsMovable ( True )
+        self.result_table.horizontalHeader ().setSectionResizeMode ( QHeaderView.Interactive )
+        layout.addWidget ( self.result_table )
+        
+        self.export_button = QPushButton ( "导出到Excel" )
+        layout.addWidget ( self.export_button )
+        self.export_button.clicked.connect ( self.export_to_excel )
+        
+        # 在第一行显示选中的产品信息，包括库存数量、组成用量和品号分类
+        self.result_table.insertRow ( 0 )
+        self.result_table.setItem ( 0, 0, QTableWidgetItem ( product_code.strip ()[:12] ) )  # 去除空格并截取前12个字符
+        self.result_table.setItem ( 0, 1, QTableWidgetItem ( product_name if product_name else "" ) )
+        self.result_table.setItem ( 0, 2, QTableWidgetItem ( product_spec if product_spec else "" ) )
+        self.result_table.setItem ( 0, 3, QTableWidgetItem ( stock_quantity if stock_quantity else "" ) )
+        self.result_table.setItem ( 0, 4, QTableWidgetItem ( component_quantity if component_quantity else "" ) )
+        self.result_table.setItem ( 0, 5, QTableWidgetItem ( category if category else "" ) )
+        
+        # 填充其他列为空字符串或默认值
+        self.result_table.setItem ( 0, 6, QTableWidgetItem ( "" ) )
+        
+        self.perform_query ( product_code )
+    
+    def perform_query ( self, product_code ):
+        connection_string = 'DRIVER={ODBC Driver 17 for SQL Server};SERVER=183.239.210.166,264;DATABASE=Aok2107;UID=AOK;PWD=123;TrustServerCertificate=yes;'
+        query = """
+        SELECT CB005,
+               (SELECT MB002 FROM INVMB WHERE MB001 = CB005) AS '品名',
+               (SELECT MB003 FROM INVMB WHERE MB001 = CB005) AS '规格',
+               (SELECT MB064 FROM INVMB WHERE MB001 = CB005) AS '库存数量',
+               CB008,
+               (SELECT UDF02 FROM INVMB WHERE MB001 = CB005) AS '品号分类',
+               CB021 AS '位标'
+        FROM BOMCB
+        WHERE CB001 = ?
+        """
+        try:
+            with pyodbc.connect ( connection_string ) as conn:
+                cursor = conn.cursor ()
+                cursor.execute ( query, product_code.strip () )  # 去除空格
+                results = cursor.fetchall ()
+                self.update_results ( results )
+        except Exception as e:
+            QMessageBox.critical ( self, "查询失败", "查询失败: " + str ( e ) )
+    
+    def update_results ( self, results ):
+        # 由于第一行已被初始化用于显示选中的产品信息，从第二行开始添加查询结果
+        initialRowCount = self.result_table.rowCount ()
+        
+        # 调整表格的行数以容纳查询结果，+1 是为了保留第一行
+        self.result_table.setRowCount ( len ( results ) + 1 )
+        
+        red_font = QBrush ( QColor ( 255, 0, 0 ) )  # 用于第一行的红色字体
+        
+        for row_num, row_data in enumerate ( results, start=1 ):  # 从第二行开始填充数据
+            for col_num, data in enumerate ( row_data ):
+                # 检查数据是否为 decimal.Decimal 类型，如果是，则进行格式化
+                formatted_data = "{:.2f}".format ( data ) if isinstance ( data, decimal.Decimal ) else str ( data )
+                item = QTableWidgetItem ( formatted_data )
+                
+                # 对于品号列（第一列），去除空格并截取前12个字符
+                if col_num==0:
+                    item.setText ( item.text ().strip ()[:12] )
+                
+                # 对于非第一行的数据，不设置红色字体
+                self.result_table.setItem ( row_num, col_num, item )
+        
+        # 保留对第一行特殊处理的逻辑，确保即便在添加结果后，第一行依然保持红色字体
+        for col in range ( self.result_table.columnCount () ):
+            first_row_item = self.result_table.item ( 0, col )
+            if first_row_item:  # 如果第一行的单元格已经设置了值，则改变其字体颜色为红色
+                first_row_item.setForeground ( red_font )
+    
+    def export_to_excel ( self ):
+        options = QFileDialog.Options ()
+        filePath, _ = QFileDialog.getSaveFileName ( self, "保存Excel文件", "", "Excel Files (*.xlsx)", options=options )
+        if filePath:
+            if not filePath.endswith ( '.xlsx' ):
+                filePath += '.xlsx'
+            column_headers = [self.result_table.horizontalHeaderItem ( i ).text () for i in
+                              range ( self.result_table.columnCount () )]
+            data_rows = []
+            for row in range ( self.result_table.rowCount () ):
+                row_data = []
+                for column in range ( self.result_table.columnCount () ):
+                    item = self.result_table.item ( row, column )
+                    row_data.append ( item.text () if item else '' )
+                data_rows.append ( row_data )
+            df = pd.DataFrame ( data_rows, columns=column_headers )
+            df.to_excel ( filePath, index=False )
+            QMessageBox.information ( self, "导出成功", f"数据已导出到 {filePath}" )
+    
+    def on_table_item_clicked ( self, item ):
+        if item.column ()==0:  # 假定第一列为品号列
+            product_code = item.text ().strip ()[:12]  # 去除空格并截取前12个字符
+            self.entry.setText ( product_code )
+
+class CustomTableWidget ( QTableWidget ):
+    def __init__ ( self, parent=None ):
+        super ().__init__ ( parent )
+    def keyPressEvent ( self, event ):
+        if event.key ()==Qt.Key_Return or event.key ()==Qt.Key_Enter:
+            self.parent ().execute_bom_query ()
+        else:
+            super ().keyPressEvent ( event )
+
+
+class MainWindow ( QMainWindow ):
+    def __init__ ( self ) -> object:
+        super ().__init__ ()
+        self.setWindowTitle ( "易飞BOM查询工具V1.6" )
+        self.setGeometry ( 100, 100, 900, 600 )
+        self.result_table = QTableWidget ()
+        # 在表格初始化部分添加以下代码
+        for col in range ( self.result_table.columnCount () ):
+            self.result_table.horizontalHeader ().setSectionResizeMode ( col, QHeaderView.Stretch )
+            self.result_table.horizontalHeader ().setSectionResizeMode ( col, QHeaderView.Interactive )
+
+        palette = self.palette ()
+        palette.setColor ( QPalette.Window, QColor ( 236, 236, 236 ) )  # Mac风格的灰色背景
+        self.setPalette ( palette )
+        
+        self.central_widget = QWidget ()
+        self.setCentralWidget ( self.central_widget )
+        main_layout = QVBoxLayout ()
+        self.central_widget.setLayout ( main_layout )
+        
+        query_layout = QHBoxLayout ()
+        main_layout.addLayout ( query_layout )
+        
+        self.entry = QLineEdit ()
+        query_layout.addWidget ( self.entry )
+        self.entry.returnPressed.connect ( self.execute_query )
+        self.entry.setMinimumWidth ( 200 )
+        
+        self.category_combobox = QComboBox ()
+        self.category_combobox.addItems ( ["全部", "定制产品", "定制材料", "标准材料", "标准产品", "配置产品"] )
+        query_layout.addWidget ( self.category_combobox )
+        
+        self.query_button = QPushButton ( "执行查询" )
+        self.query_button.clicked.connect ( self.execute_query )
+        query_layout.addWidget ( self.query_button )
+        
+        # 将"BOM查询"按钮添加到"执行查询"按钮之后
+        self.bom_query_button = QPushButton ( "BOM查询" )
+        self.bom_query_button.clicked.connect ( self.execute_bom_query )
+        query_layout.addWidget ( self.bom_query_button )
+        
+        # 在__init__方法中的适当位置添加以下代码
+        self.bomReverseQueryButton = QPushButton ( "BOM反查", self )
+        self.bomReverseQueryButton.clicked.connect ( self.execute_bom_reverse_query )  # 设置点击时的槽函数
+        query_layout.addWidget ( self.bomReverseQueryButton )  # 假设query_layout是放置查询相关控件的布局
+        
+        self.ebom_query_button = QPushButton ( "EBOM查询" )
+        self.ebom_query_button.clicked.connect ( self.show_ebom_query_window )
+        query_layout.addWidget ( self.ebom_query_button )
+        
+        self.deduplicate_button = QPushButton ( "数据去重" )
+        self.deduplicate_button.clicked.connect ( self.deduplicate_view_data )
+        query_layout.addWidget ( self.deduplicate_button )
+        
+        # 在__init__方法中添加以下代码
+        self.prev_query_button = QPushButton ( "上一步" )
+        self.prev_query_button.clicked.connect ( self.prev_query )
+        query_layout.addWidget ( self.prev_query_button )
+        
+        self.next_query_button = QPushButton ( "下一步" )
+        self.next_query_button.clicked.connect ( self.next_query )
+        query_layout.addWidget ( self.next_query_button )
+        
+        # 初始化用于导航的变量
+        self.current_history_index = -1  # 当前查询历史的索引
+        self.query_history = []  # 存储查询历史（输入值，选定类别，查询结果）
+        
+        self.export_button = QPushButton ( "导出Excel" )
+        self.export_button.clicked.connect ( self.export_to_excel )
+        query_layout.addWidget ( self.export_button )
+        
+        self.connect_server_button = QPushButton ( "连接服务器" )
+        self.connect_server_button.clicked.connect ( self.connect_to_server )
+        # 假设你的布局变量名为query_layout
+        query_layout.addWidget ( self.connect_server_button )
+        
+        self.result_table = QTableWidget ()
+        self.result_table.setColumnCount ( 10 )  # 增加列数
+        self.result_table.setHorizontalHeaderLabels (
+            ["品号", "品名", "规格", "库存数量", "组成用量", "品号分类", "附件ID", "文件名", "文件更新日期","物料更新日期"] )
+        self.result_table.horizontalHeader ().setSectionResizeMode ( QHeaderView.Stretch )
+        self.result_table.setSortingEnabled ( True )
+        self.result_table.horizontalHeader ().setSectionsMovable ( True )
+        self.result_table.horizontalHeader ().setSectionResizeMode ( QHeaderView.Interactive )
+        main_layout.addWidget ( self.result_table )
+        
+        self.result_table.setStyleSheet ( """
+            QTableWidget {
+                gridline-color: #006400; /* 深绿色网格线 */
+                background-color: #C7EDCC; /* 护眼绿色背景 */
+            }
+            QTableWidget::item {
+                border: 1px solid #006400; /* 对每个单元格应用深绿色边框 */
+            }
+            QHeaderView::section {
+                background-color: #A4D3A4; /* 护眼绿色表头背景，颜色稍深 */
+                padding: 4px;
+                border: 1px solid #006400; /* 表头加深绿色边框 */
+                font-size: 12pt; /* 字体大小 */
+            }
+            QTableWidget::item:selected {
+                background-color: #0078D7; /* 选中项的背景色设置为蓝色 */
+                color: white; /* 选中项的文字颜色设置为白色 */
+            }
+        """ )
+        
+        self.result_table.itemDoubleClicked.connect ( self.onItemDoubleClicked )
+        self.result_table.itemClicked.connect ( self.on_table_item_clicked )
+        
+        self.bomQueryResultWindow = None  # 用于保存BOM查询结果窗口的引用
+        
+        self.row_count_label = QLabel ( "总行数：0" )
+        main_layout.addWidget ( self.row_count_label )
+        
+        self.input_history = []
+        self.query_results = []
+    
+    def deduplicate_view_data ( self ):
+        unique_products = {}
+        
+        # 遍历表格中的每一行来收集数据
+        for row in range ( self.result_table.rowCount () ):
+            product_code = self.result_table.item ( row, 0 ).text ().strip ()
+            attachment_id = self.result_table.item ( row, 6 ).text ().strip () if self.result_table.item ( row,
+                                                                                                           6 ) else None  # 获取附件ID
+            
+            if attachment_id is not None:  # 添加对附件ID为None的检查
+                row_data = [self.result_table.item ( row, col ).text () if self.result_table.item ( row, col ) else ""
+                            for
+                            col in range ( self.result_table.columnCount () )]
+                create_date = row_data[-2]  # 假设最后一列是物料更新日期
+                
+                if product_code not in unique_products:
+                    unique_products[product_code] = row_data
+                else:
+                    existing_row_data = unique_products[product_code]
+                    existing_create_date = existing_row_data[-2]
+                    if not existing_create_date or (create_date and create_date > existing_create_date):
+                        unique_products[product_code] = row_data
+        
+        # 清空表格
+        self.result_table.setRowCount ( 0 )
+        
+        # 重新填充表格数据
+        for row_data in unique_products.values ():
+            row_position = self.result_table.rowCount ()
+            self.result_table.insertRow ( row_position )
+            for col, data in enumerate ( row_data ):
+                self.result_table.setItem ( row_position, col, QTableWidgetItem ( data ) )
+        
+        # 更新行数统计
+        self.row_count_label.setText ( f"总行数：{len ( unique_products )}" )
+    
+    def connect_to_server ( self ):
+        command = r"net use \\AOK-YF-SERVER\DocLibrary /user:administrator WaGjfAa1998pa"
+        try:
+            subprocess.run ( command, check=True, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE )
+            QMessageBox.information ( self, "连接成功", "成功连接到服务器。" )
+        except subprocess.CalledProcessError as e:
+            QMessageBox.critical ( self, "连接失败", f"无法连接到服务器: {e}" )
+    
+    def execute_query ( self ):
+        input_value = self.entry.text ().strip ()
+        selected_category = self.category_combobox.currentText ()
+        self.perform_query ( input_value, selected_category )
+        # 保存查询到历史
+        self.query_history.append ( (input_value, selected_category, self.query_results) )
+        self.current_history_index = len ( self.query_history ) - 1
+    
+    def on_table_item_clicked ( self, item ):
+        if item.column ()==0:  # 假定第一列为品号列
+            product_code = item.text ().strip ()[:12]  # 去除空格并截取前12个字符
+            self.entry.setText ( product_code )
+    
+    def save_query_to_history ( self, input_value, selected_category, query_results ):
+        self.current_history_index += 1
+        # 如果当前不在历史记录的末尾，截断后面的记录
+        self.query_history = self.query_history[:self.current_history_index]
+        self.query_history.append ( (input_value, selected_category, query_results) )
+        self.update_results ( query_results )
+    
+    def prev_query ( self ):
+        if self.current_history_index > 0:
+            self.current_history_index -= 1
+            history_item = self.query_history[self.current_history_index]
+            self.entry.setText ( history_item[0] )
+            self.category_combobox.setCurrentText ( history_item[1] )
+            self.query_results = history_item[2]
+            self.update_results ( history_item[2] )
+    
+    def next_query ( self ):
+        if self.current_history_index < len ( self.query_history ) - 1:
+            self.current_history_index += 1
+            history_item = self.query_history[self.current_history_index]
+            self.entry.setText ( history_item[0] )
+            self.category_combobox.setCurrentText ( history_item[1] )
+            self.query_results = history_item[2]
+            self.update_results ( history_item[2] )
+    
+    def perform_query ( self, input_value, selected_category ):
+        try:
+            # 数据库连接字符串
+            connection_string = 'DRIVER={ODBC Driver 17 for SQL Server};SERVER=183.239.210.166,264;DATABASE=Aok2107;UID=AOK;PWD=123;TrustServerCertificate=yes;'
+            
+            # 创建数据库连接
+            connection = pyodbc.connect ( connection_string )
+            cursor = connection.cursor ()
+            
+            search_conditions = []
+            parameters = []
+            
+            if '%' in input_value:
+                # 直接使用输入值进行查询，适用于用户输入了特定的查询模式
+                search_conditions.append (
+                    "(LOWER(MB001) LIKE LOWER(?) OR LOWER(MB002) LIKE LOWER(?) OR LOWER(MB003) LIKE LOWER(?))" )
+                parameters.extend ( [input_value, input_value, input_value] )
+            else:
+                # 处理可能的多条件搜索
+                input_conditions = input_value.split ()
+                for condition in input_conditions:
+                    search_conditions.append (
+                        "(LOWER(MB001) LIKE LOWER(?) OR LOWER(MB002) LIKE LOWER(?) OR LOWER(MB003) LIKE LOWER(?))" )
+                    like_value = f"%{condition}%"
+                    parameters.extend ( [like_value, like_value, like_value] )
+            
+            if selected_category and selected_category!="全部":
+                search_conditions.append ( "UDF02 = ?" )
+                parameters.append ( selected_category )
+            
+            query = """
+                SELECT RTRIM(INVMB.MB001), INVMB.MB002, INVMB.MB003, INVMB.MB064, INVMB.MB438, INVMB.UDF02, ATTACH.DocID, ATTACH.FileName, ATTACH.AddDate,INVMB.MODI_DATE
+                FROM INVMB
+                LEFT JOIN DSCSYS.dbo.ATTACH ON INVMB.MB001 = ATTACH.KeyValues
+            """
+            
+            if search_conditions:
+                query += " WHERE " + " AND ".join ( search_conditions )
+            
+            cursor.execute ( query, parameters )
+            self.query_results = cursor.fetchall ()
+            self.update_results ( self.query_results )
+            
+            connection.close ()
+        except pyodbc.Error as e:
+            QMessageBox.critical ( self, "查询失败", f"查询失败: {e}" )
+
+    def update_results ( self , results ):
+        self.result_table.setSortingEnabled ( False )  # 在更新数据前禁用排序
+    
+        self.result_table.setRowCount ( 0 )  # 清空表格以准备添加新的查询结果
+        tracked_attachments = {}  # 键是品号，值是该品号已添加的附件ID集合
+    
+        for row_data in results:
+            product_code = str ( row_data[0] ).strip ()[:10]  # 获取品号并裁剪到前10个字符
+            attachment_id = str ( row_data[6] ).strip ()  # 获取附件ID
+        
+            if product_code not in tracked_attachments:
+                tracked_attachments[product_code] = set ()
+        
+            # 检查附件ID对于同一品号是否唯一
+            if attachment_id not in tracked_attachments[product_code]:
+                tracked_attachments[product_code].add ( attachment_id )
+            
+                # 添加这条数据到表格中
+                row_number = self.result_table.rowCount ()
+                self.result_table.insertRow ( row_number )
+                for column_number , data in enumerate ( row_data ):
+                    if isinstance ( data , decimal.Decimal ):
+                        formatted_data = "{:.2f}".format ( data )
+                    else:
+                        formatted_data = str ( data )
+                    self.result_table.setItem ( row_number , column_number , QTableWidgetItem ( formatted_data ) )
+    
+        self.result_table.setSortingEnabled ( True )  # 更新数据后重新启用排序
+        self.row_count_label.setText ( f"总行数：{self.result_table.rowCount ()}" )  # 更新行数统计
+
+    def eventFilter ( self, source, event ):
+        if event.type ()==QEvent.KeyPress and source is self.result_table:
+            if event.key () in (Qt.Key_Return, Qt.Key_Enter):
+                self.execute_bom_query ()
+                return True  # 事件被处理，不再传递
+        return super ().eventFilter ( source, event )
+    
+    def filterByProductCode ( self, product_code ):
+        # 基于品号过滤，但保留不同的附件ID
+        filtered_results = [row for row in self.query_results if row[0].strip ()==product_code.strip ()]
+        
+        # 使用一个字典来记录每个品号下的不同附件ID
+        unique_attachment_ids_per_product = {}
+        
+        for row in filtered_results:
+            prod_code = row[0].strip ()  # 假设品号在第一列
+            attachment_id = row[6].strip ()  # 假设附件ID在第七列
+            if prod_code not in unique_attachment_ids_per_product:
+                unique_attachment_ids_per_product[prod_code] = {attachment_id}
+            else:
+                unique_attachment_ids_per_product[prod_code].add ( attachment_id )
+        
+        # 重新设置表格行数
+        self.result_table.setRowCount ( 0 )
+        
+        # 遍历filtered_results，只添加每个品号下不同附件ID的行
+        for row_data in filtered_results:
+            prod_code = row_data[0].strip ()
+            attachment_id = row_data[6].strip ()
+            if attachment_id in unique_attachment_ids_per_product.get ( prod_code, set () ):
+                # 添加行到表格
+                row_number = self.result_table.rowCount ()
+                self.result_table.insertRow ( row_number )
+                for column_number, data in enumerate ( row_data ):
+                    if isinstance ( data, decimal.Decimal ):
+                        formatted_data = "{:.2f}".format ( data )
+                    else:
+                        formatted_data = str ( data )
+                    item = QTableWidgetItem ( formatted_data )
+                    self.result_table.setItem ( row_number, column_number, item )
+                # 从集合中移除已添加的附件ID，避免重复添加
+                unique_attachment_ids_per_product[prod_code].remove ( attachment_id )
+        
+        self.row_count_label.setText ( f"总行数：{self.result_table.rowCount ()}" )
+    
+    def onItemDoubleClicked ( self, item ):
+        try:
+            column = item.column ()
+            row = item.row ()
+            if column==0:  # 假设品号在第一列
+                product_code_item = self.result_table.item ( row, column )
+                if product_code_item:
+                    product_code = product_code_item.text ()
+                    # 维持原有的品号过滤功能
+                    self.filterByProductCode ( product_code )
+            elif column==6:  # 假设附件ID在第七列
+                attachment_id = item.text ()
+                # 创建并显示FileSearchWindow实例，将附件ID作为初始搜索词
+                self.fileSearchWindow = FileSearchWindow ( initial_search=attachment_id )
+                self.fileSearchWindow.show ()
+        except Exception as e:
+            QMessageBox.critical ( self, "错误", f"操作失败: {str ( e )}" )
+    
+    def execute_bom_query ( self ):
+        row = self.result_table.currentRow ()
+        if row < 0:
+            QMessageBox.warning ( self, "警告", "请先选择一个产品行" )
+            return
+        
+        # 获取品号、品名、规格、库存数量、组成用量和品号分类的数据
+        product_code = self.result_table.item ( row, 0 ).text ().strip ()
+        product_name = self.result_table.item ( row, 1 ).text ()
+        product_spec = self.result_table.item ( row, 2 ).text ()
+        stock_quantity = self.result_table.item ( row, 3 ).text ()  # 假设库存数量在第4列
+        component_quantity = self.result_table.item ( row, 4 ).text ()  # 假设组成用量在第5列
+        category = self.result_table.item ( row, 5 ).text ()  # 假设品号分类在第6列
+        
+        # 传递这些数据到BOMQueryResultWindow
+        self.bomQueryResultWindow = BOMQueryResultWindow ( product_code, product_name, product_spec, stock_quantity,
+                                                           component_quantity, category )
+        self.bomQueryResultWindow.show ()
+    
+    def perform_bom_query ( self, input_value, selected_category, selected_row_index ):
+        try:
+            connection_string = 'DRIVER={ODBC Driver 17 for SQL Server};SERVER=183.239.210.166,264;DATABASE=Aok2107;UID=AOK;PWD=123;TrustServerCertificate=yes;'
+            connection = pyodbc.connect ( connection_string )
+            cursor = connection.cursor ()
+            
+            bom_query = f"""
+            SELECT CB005 AS '品号',
+                   (SELECT MB002 FROM INVMB WHERE MB001 = BOMCB.CB005) AS '品名',
+                   (SELECT MB003 FROM INVMB WHERE MB001 = BOMCB.CB005) AS '规格',
+                   (SELECT MB064 FROM INVMB WHERE MB001 = BOMCB.CB005) AS '库存数量',
+                   CB008 AS '组成用量',
+                   (SELECT UDF02 FROM INVMB WHERE MB001 = BOMCB.CB005) AS '品号分类'
+            FROM BOMCB
+            WHERE CB001 = ?
+            """
+            cursor.execute ( bom_query, (input_value,) )
+            results = cursor.fetchall ()
+            
+            selected_row = ('*' + self.result_table.item ( selected_row_index, 0 ).text (),) + tuple (
+                self.result_table.item ( selected_row_index, col ).text () for col in
+                range ( 1, self.result_table.columnCount () ) )
+            results_with_selected = [selected_row] + results
+            
+            self.update_results ( results_with_selected )
+            connection.close ()
+        except pyodbc.Error as e:
+            QMessageBox.critical ( self, "BOM查询失败", f"查询失败: {e}" )
+    
+    def perform_bom_reverse_query ( self, product_code ):
+        try:
+            connection_string = 'DRIVER={ODBC Driver 17 for SQL Server};SERVER=183.239.210.166,264;DATABASE=Aok2107;UID=AOK;PWD=123;TrustServerCertificate=yes;'
+            connection = pyodbc.connect ( connection_string )
+            cursor = connection.cursor ()
+            
+            # 修正后的查询，包含对ATTACH表的左连接，以获取附件信息
+            query = """
+            SELECT
+                BOMCB.CB001 AS '品号',
+                INVMB.MB002 AS '品名',
+                INVMB.MB003 AS '规格',
+                INVMB.MB064 AS '库存数量',
+                BOMCB.CB008 AS '组成用量',
+                INVMB.UDF02 AS '品号分类',
+                ATTACH.DocID AS '附件ID',
+                ATTACH.FileName AS '文件名',
+                ATTACH.AddDate AS '文件更新日期'
+                INVMB.MODI_DATE AS '物料更新日期'
+            FROM BOMCB
+            INNER JOIN INVMB ON BOMCB.CB001 = INVMB.MB001
+            LEFT JOIN DSCSYS.dbo.ATTACH ON INVMB.MB001 = ATTACH.KeyValues
+            WHERE BOMCB.CB005 = ?
+            """
+            
+            cursor.execute ( query, (product_code,) )
+            results = cursor.fetchall ()
+            connection.close ()
+            
+            # 更新MainWindow的result_table
+            self.update_results ( results )
+        
+        except pyodbc.Error as e:
+            QMessageBox.critical ( self, "BOM反查失败", f"查询失败: {e}" )
+        
+        # 更新行数统计
+        self.row_count_label.setText ( f"总行数：{self.result_table.rowCount ()}" )
+    
+    def update_a18_search_box ( attachment_id ):
+        # 示例：将附件ID写入由A18监视的文件
+        with open ( 'path_to_watched_file', 'w' ) as file:
+            file.write ( attachment_id )
+    
+    def export_to_excel ( self ):
+        options = QFileDialog.Options ()
+        fileName, _ = QFileDialog.getSaveFileName ( self, "保存Excel文件", "", "Excel Files (*.xlsx)", options=options )
+        if fileName:
+            if not fileName.endswith ( '.xlsx' ):
+                fileName += '.xlsx'
+            try:
+                column_headers = [self.result_table.horizontalHeaderItem ( i ).text () for i in
+                                  range ( self.result_table.columnCount () )]
+                table_data = []
+                for row in range ( self.result_table.rowCount () ):
+                    row_data = []
+                    for column in range ( self.result_table.columnCount () ):
+                        item = self.result_table.item ( row, column )
+                        row_data.append ( item.text () if item else '' )
+                    table_data.append ( row_data )
+                df = pd.DataFrame ( table_data, columns=column_headers )
+                df.to_excel ( fileName, index=False )
+                QMessageBox.information ( self, "导出成功", f"数据已导出到 {fileName}" )
+            except Exception as e:
+                QMessageBox.critical ( self, "导出失败", f"发生错误: {e}" )
+    
+    def show_ebom_query_window ( self ):
+        self.ebom_window = EBOMQueryWindow ()
+        self.ebom_window.show ()
+    
+    def execute_bom_reverse_query ( self ):
+        input_value = self.entry.text ().strip ()
+        if not input_value:
+            QMessageBox.warning ( self, "警告", "请输入或选择一个产品品号进行BOM反查" )
+            return
+        
+        try:
+            connection_string = 'DRIVER={ODBC Driver 17 for SQL Server};SERVER=183.239.210.166,264;DATABASE=Aok2107;UID=AOK;PWD=123;TrustServerCertificate=yes;'
+            connection = pyodbc.connect ( connection_string )
+            cursor = connection.cursor ()
+            
+            query = """
+            SELECT
+                BOMCB.CB001 AS '品号',
+                INVMB.MB002 AS '品名',
+                INVMB.MB003 AS '规格',
+                INVMB.MB064 AS '库存数量',
+                BOMCB.CB008 AS '组成用量',
+                INVMB.UDF02 AS '品号分类',
+                ATTACH.DocID AS '附件ID',
+                ATTACH.FileName AS '文件名',
+                ATTACH.AddDate AS '文件物料更新日期',
+                INVMB.MODI_DATE AS '物料更新日期'
+            FROM BOMCB
+            INNER JOIN INVMB ON BOMCB.CB001 = INVMB.MB001
+            LEFT JOIN DSCSYS.dbo.ATTACH ON INVMB.MB001 = ATTACH.KeyValues
+            WHERE BOMCB.CB005 = ?
+            """
+            
+            cursor.execute ( query, (input_value,) )
+            results = cursor.fetchall ()
+            connection.close ()
+            
+            if not results:
+                QMessageBox.information ( self, "结果", "没有找到与此品号相关的BOM反查结果。" )
+                return
+            
+            # 更新MainWindow的result_table
+            self.update_results ( results )
+        
+        except pyodbc.Error as e:
+            QMessageBox.critical ( self, "BOM反查失败", f"查询失败: {e}" )
+        
+        # 更新查询历史，以便"上一步"和"下一步"按钮可以正确工作
+        self.query_history.append ( (input_value, 'BOM反查', results) )
+        self.current_history_index = len ( self.query_history ) - 1
+    
+    def showEvent ( self, event ):
+        # 淡入效果的实现
+        self.fadeIn ()
+    
+    def fadeIn ( self ):
+        self.animation = QPropertyAnimation ( self, QByteArray ( b'windowOpacity' ) )
+        self.animation.setDuration ( 500 )  # 动画时长1000毫秒
+        self.animation.setStartValue ( 0.0 )
+        self.animation.setEndValue ( 1.0 )
+        self.animation.start ()
+
+
+if __name__=="__main__":
+    app = QApplication ( sys.argv )
+    
+    # 设置样式表以实现按钮的3D突出感
+    app.setStyleSheet ( """
+        QMainWindow {
+            background-color: #F0F0F0; /* 淡灰色背景 */
+        }
+        QPushButton {
+            background-color: qlineargradient(x1: 0, y1: 0, x2: 0, y2: 1,
+                                              stop: 0 #DEE4E7, stop: 1 #BCCED9);
+            color: #2E4158;
+            border: 2px solid #A7B6C2;
+            border-radius: 10px;
+            padding: 5px 15px;
+            font-weight: bold;
+            font-size: 12pt;
+            text-shadow: 1px 1px 1px #AAA;
+            box-shadow: 5px 5px 10px #A7B6C2;
+        }
+        QPushButton:hover {
+            background-color: qlineargradient(x1: 0, y1: 0, x2: 0, y2: 1,
+                                              stop: 0 #E5EBEF, stop: 1 #CFD8E3);
+        }
+        QPushButton:pressed {
+            background-color: qlineargradient(x1: 0, y1: 0, x2: 0, y2: 1,
+                                              stop: 0 #BCCED9, stop: 1 #DEE4E7);
+            box-shadow: inset 2px 2px 5px #A7B6C2;
+        }
+        QLineEdit, QComboBox {
+            border: 1px solid #A7B6C2;
+            border-radius: 8px;
+            padding: 5px;
+            background-color: #FFFFFF;
+            font-size: 10pt;
+        }
+        QTableWidget, QHeaderView {
+            border-radius: 8px;
+            gridline-color: #DADCE0;
+            font-size: 10pt;
+        }
+        QLabel {
+            font-size: 12pt;
+            color: #2E4158;
+            text-shadow: 1px 1px 1px #AAA;
+        }
+    """ )
+    
+    window = MainWindow ()
+    window.show ()
+    sys.exit ( app.exec_ () )
+
+
